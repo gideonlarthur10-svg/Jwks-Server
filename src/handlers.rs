@@ -22,7 +22,7 @@ fn parse_basic(req: &HttpRequest) -> Option<(String, String)> {
     Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
 }
 
-// -------------------- REGISTER --------------------
+// REGISTER 
 
 #[derive(Deserialize)]
 pub struct RegisterIn {
@@ -153,7 +153,7 @@ pub async fn auth(
     }))
 }
 
-// -------------------- JWKS --------------------
+// JWKS 
 
 #[derive(Serialize)]
 struct Jwk<'a> {
