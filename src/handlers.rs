@@ -1,96 +1,150 @@
 use actix_web::{http::header, web, HttpRequest, HttpResponse, Responder};
-use chrono::{Duration, Utc};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use r2d2_sqlite::SqliteConnectionManager;
-use r2d2::Pool;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use chrono::{Utc, Duration};
+use jsonwebtoken::{Header, Algorithm, EncodingKey};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use password_hash::{SaltString, PasswordHash};
+use uuid::Uuid;
+use base64::{engine::general_purpose, Engine as _};
 
 use crate::db;
+use crate::db::DbPool;
+use crate::AppState;
 
-type DbPool = Pool<SqliteConnectionManager>;
-
-/// Quick/lenient Basic auth parser (mocked — we do not validate)
-fn _parse_basic_auth(req: &HttpRequest) -> Option<(String, String)> {
-    use base64::{engine::general_purpose, Engine as _};
-
+fn parse_basic(req: &HttpRequest) -> Option<(String, String)> {
     let hdr = req.headers().get(header::AUTHORIZATION)?;
     let s = hdr.to_str().ok()?;
-    // Expect "Basic <b64>"
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() != 2 || parts[0] != "Basic" {
-        return None;
-    }
+    if parts.len() != 2 || parts[0] != "Basic" { return None; }
     let decoded = general_purpose::STANDARD.decode(parts[1]).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    // Expect "user:pass"
-    let mut it = decoded.splitn(2, ':');
-    let u = it.next()?.to_string();
-    let p = it.next().unwrap_or("").to_string();
-    Some((u, p))
+    let s = String::from_utf8(decoded).ok()?;
+    let mut it = s.splitn(2, ':');
+    Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
+}
+
+// -------------------- REGISTER --------------------
+
+#[derive(Deserialize)]
+pub struct RegisterIn {
+    username: String,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Serialize)]
-struct TokenResponse<'a> {
+pub struct RegisterOut {
+    password: String,
+}
+
+pub async fn register(state: web::Data<AppState>, body: web::Json<RegisterIn>) -> impl Responder {
+    // generate password
+    let password = Uuid::new_v4().to_string();
+
+    // hash with Argon2 (reasonable defaults; you can tune params)
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let argon2 = Argon2::default();
+    let hash = argon2.hash_password(password.as_bytes(), &salt)
+        .map_err(|e| {
+            log::error!("argon2 error: {e}");
+            HttpResponse::InternalServerError().finish()
+        })?
+        .to_string();
+
+    // store
+    match db::insert_user(&state.pool, &body.username, body.email.as_deref(), &hash) {
+        Ok(_) => HttpResponse::Created().json(RegisterOut { password }),
+        Err(e) => {
+            // uniqueness errors, etc.
+            log::warn!("insert user failed: {e}");
+            HttpResponse::BadRequest().body("username or email already exists")
+        }
+    }
+}
+
+// -------------------- AUTH --------------------
+
+#[derive(Serialize)]
+struct AuthOut<'a> {
     token: &'a str,
     kid: String,
     key_expiry: i64,
 }
 
-/// POST /auth
-/// - If `?expired=true`, use an expired key; otherwise use an unexpired key.
-/// - JWT RS256 signed; header.kid set to DB `kid`.
 pub async fn auth(
     req: HttpRequest,
-    pool: web::Data<DbPool>,
+    state: web::Data<AppState>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> impl Responder {
-    // Parse (and ignore) HTTP Basic if present (for Gradebot)
-    let _maybe_basic = _parse_basic_auth(&req);
+    // rate limit: 10 req/s global
+    if let Err(_) = state.limiter.check() {
+        return HttpResponse::TooManyRequests().finish();
+    }
 
+    let (username, password) = match parse_basic(&req) {
+        Some(v) => v,
+        None => return HttpResponse::Unauthorized().body("Basic auth required"),
+    };
+
+    // verify user
+    let (user_id, stored_hash) = match db::find_user_by_username(&state.pool, &username) {
+        Ok(Some(t)) => t,
+        Ok(None) => return HttpResponse::Unauthorized().finish(),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("db error: {e}")),
+    };
+    let parsed = PasswordHash::new(&stored_hash).map_err(|_| HttpResponse::InternalServerError())?;
+    if Argon2::default().verify_password(password.as_bytes(), &parsed).is_err() {
+        return HttpResponse::Unauthorized().finish();
+    }
+
+    // pick key (expired flag)
     let want_expired = query
         .get("expired")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-
-    // pick key
     let now = Utc::now().timestamp();
-    let row = match db::get_one_key(&pool, want_expired, now) {
+
+    let row = match db::get_one_key_decrypted(&state.pool, &state.aes, want_expired, now) {
         Ok(Some(r)) => r,
         Ok(None) => return HttpResponse::InternalServerError().body("no suitable key"),
-        Err(e) => return HttpResponse::InternalServerError().body(format!("db error: {e}")),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("db err: {e}")),
     };
 
-    // Build EncodingKey from PEM
-    let encoding = match EncodingKey::from_rsa_pem(row.pem.as_bytes()) {
-        Ok(k) => k,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("bad key: {e}")),
-    };
-
-    // Claims
+    // sign JWT
     #[derive(Serialize)]
     struct Claims {
         sub: String,
         iat: i64,
         exp: i64,
         username: String,
+        uid: i64,
     }
-    let now_dt = Utc::now();
-    let exp = now_dt + Duration::minutes(5);
+    let iat = Utc::now();
     let claims = Claims {
-        sub: "fake-user".into(),
-        iat: now_dt.timestamp(),
-        exp: exp.timestamp(),
-        username: "userABC".into(), // per spec; not actually validated
+        sub: "user".into(),
+        iat: iat.timestamp(),
+        exp: (iat + Duration::minutes(5)).timestamp(),
+        username: username.clone(),
+        uid: user_id,
     };
-
-    // JWT header with kid
-    let mut hdr = Header::new(Algorithm::RS256);
-    hdr.kid = Some(row.kid.to_string());
-
-    let token = match jsonwebtoken::encode(&hdr, &claims, &encoding) {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(row.kid.to_string());
+    let enc = match EncodingKey::from_rsa_pem(row.pem.as_bytes()) {
+        Ok(k) => k,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("bad key: {e}")),
+    };
+    let token = match jsonwebtoken::encode(&header, &claims, &enc) {
         Ok(t) => t,
         Err(e) => return HttpResponse::InternalServerError().body(format!("sign error: {e}")),
     };
+
+    // log success (only successful requests are logged)
+    let ip = req
+        .connection_info()
+        .realip_remote_addr()
+        .unwrap_or("unknown")
+        .to_string();
+    let _ = db::log_auth(&state.pool, user_id, &ip);
+    let _ = db::touch_last_login(&state.pool, user_id);
 
     HttpResponse::Ok().json(serde_json::json!({
         "token": token,
@@ -99,50 +153,58 @@ pub async fn auth(
     }))
 }
 
-/// GET /.well-known/jwks.json
-/// - Read all unexpired keys, convert each PEM to JWK (n,e),
-///   and return a JWKS document.
-pub async fn jwks(pool: web::Data<DbPool>) -> impl Responder {
-    let now = Utc::now().timestamp();
+// -------------------- JWKS --------------------
 
-    let rows = match db::get_all_unexpired(&pool, now) {
+#[derive(Serialize)]
+struct Jwk<'a> {
+    kty: &'a str,
+    alg: &'a str,
+    #[serde(rename = "use")]
+    use_field: &'a str,
+    kid: String,
+    n: String,
+    e: String,
+}
+#[derive(Serialize)]
+struct Jwks<'a> { keys: Vec<Jwk<'a>> }
+
+pub async fn jwks(state: web::Data<AppState>) -> impl Responder {
+    let now = Utc::now().timestamp();
+    let enc_rows = match db::get_all_unexpired_enc(&state.pool, now) {
         Ok(v) => v,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("db error: {e}")),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("db err: {e}")),
     };
 
-    #[derive(Serialize)]
-    struct Jwk<'a> {
-        kty: &'a str,
-        alg: &'a str,
-        #[serde(rename = "use")]
-        use_field: &'a str,
-        kid: String,
-        n: String,
-        e: String,
-    }
-
-    #[derive(Serialize)]
-    struct Jwks<'a> {
-        keys: Vec<Jwk<'a>>,
-    }
-
-    let mut keys = Vec::with_capacity(rows.len());
-    for r in rows {
-        match db::pem_to_n_e(&r.pem) {
-            Ok((n, e)) => keys.push(Jwk {
-                kty: "RSA",
-                alg: "RS256",
-                use_field: "sig",
-                kid: r.kid.to_string(),
-                n,
-                e,
-            }),
+    // decrypt each private key to compute (n,e)
+    let mut out = Vec::with_capacity(enc_rows.len());
+    for r in enc_rows {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&state.aes.0);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&r.iv);
+        match cipher.decrypt(nonce, r.key_ct.as_ref()) {
+            Ok(plain) => {
+                if let Ok(pem) = String::from_utf8(plain) {
+                    if let Ok((n, e)) = db::pem_to_n_e(&pem) {
+                        out.push(Jwk {
+                            kty: "RSA",
+                            alg: "RS256",
+                            use_field: "sig",
+                            kid: r.kid.to_string(),
+                            n, e
+                        });
+                    }
+                }
+            }
             Err(e) => {
-                // skip bad rows; or you can return 500
-                log::warn!("PEM parse failed for kid {}: {e}", r.kid);
+                log::warn!("decrypt failed for kid {}: {e}", r.kid);
             }
         }
     }
 
-    HttpResponse::Ok().json(Jwks { keys })
+    HttpResponse::Ok().json(Jwks { keys: out })
 }
+
+
+  
+  
